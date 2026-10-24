@@ -402,13 +402,17 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
 }
 - (void)readController:(GCExtendedGamepad *)pad {
     if(!pad||activeController.extendedGamepad!=pad)return;
+    // The stick reports its own axes below, so it must not also assert the
+    // digital direction bits. Apple's directional isPressed values cross
+    // their threshold on each axis independently, so a diagonal push made
+    // the d-pad bits flicker while the stick itself was steady; a title that
+    // steers with the circle pad and puts something else on the d-pad then
+    // saw both at once.
     RHControllerButtons b={
         .bottom=pad.buttonA.isPressed,.right=pad.buttonB.isPressed,
         .left=pad.buttonX.isPressed,.top=pad.buttonY.isPressed,
         .dpadUp=pad.dpad.up.isPressed,.dpadDown=pad.dpad.down.isPressed,
         .dpadLeft=pad.dpad.left.isPressed,.dpadRight=pad.dpad.right.isPressed,
-        .stickUp=pad.leftThumbstick.up.isPressed,.stickDown=pad.leftThumbstick.down.isPressed,
-        .stickLeft=pad.leftThumbstick.left.isPressed,.stickRight=pad.leftThumbstick.right.isPressed,
         .shoulderLeft=pad.leftShoulder.isPressed,.shoulderRight=pad.rightShoulder.isPressed,
         .menu=pad.buttonMenu.isPressed,.options=pad.buttonOptions.isPressed
     };
