@@ -154,6 +154,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     uint32_t held,latched;
     GCController *activeController;
     RHControllerState controllerInput;
+    float controllerStickX,controllerStickY;
     CGPoint touchPoint;
     double lastFrameTime;
     double nextEmulationTime;
@@ -396,7 +397,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     }
 }
 - (void)clearInputs {
-    [inputLock lock];held=latched=0;touchDown=touchLatched=NO;rh_controller_clear(&controllerInput);[inputLock unlock];
+    [inputLock lock];held=latched=0;touchDown=touchLatched=NO;rh_controller_clear(&controllerInput);controllerStickX=controllerStickY=0;[inputLock unlock];
     for(UIButton *button in buttons) button.alpha=1;
 }
 - (void)readController:(GCExtendedGamepad *)pad {
@@ -412,7 +413,11 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         .menu=pad.buttonMenu.isPressed,.options=pad.buttonOptions.isPressed
     };
     BOOL enabled=!paused&&!keyboardActive&&!failed&&UIApplication.sharedApplication.applicationState==UIApplicationStateActive;
-    [inputLock lock];rh_controller_update(&controllerInput,rh_controller_mask(b),enabled);[inputLock unlock];
+    // Keep the analogue axes as well: the stick is a circle pad, and titles
+    // that steer with it ignore the digital direction bits.
+    float stickX=pad.leftThumbstick.xAxis.value,stickY=pad.leftThumbstick.yAxis.value;
+    [inputLock lock];controllerStickX=stickX;controllerStickY=stickY;
+    rh_controller_update(&controllerInput,rh_controller_mask(b),enabled);[inputLock unlock];
 }
 - (void)controllersChanged:(NSNotification *)notification {
     if(!NSThread.isMainThread) {
@@ -430,7 +435,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     if(selected==activeController) { [self readController:selected.extendedGamepad];return; }
     activeController.extendedGamepad.valueChangedHandler=nil;
     [inputLock lock];
-    controllerInput=(RHControllerState){0};
+    controllerInput=(RHControllerState){0};controllerStickX=controllerStickY=0;
     // Connecting hides the face/direction buttons. Release their touch
     // source, while keeping the independent lower-screen touch intact.
     if(selected)held=latched=0;
@@ -506,8 +511,9 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         uint32_t keys=held|latched|rh_controller_take(&controllerInput);latched=0;
         BOOL touched=touchDown||touchLatched;touchLatched=NO;
         uint16_t x=(uint16_t)touchPoint.x,y=(uint16_t)touchPoint.y;
+        float circleX=controllerStickX,circleY=controllerStickY;
         [inputLock unlock];
-        int result=rh_step(machine,keys,touched,x,y);
+        int result=rh_step(machine,keys,touched,x,y,circleX,circleY);
         int16_t samples[8192];size_t count=rh_audio(machine,samples,4096);
         [sound push:samples frames:count];
         if(result) {

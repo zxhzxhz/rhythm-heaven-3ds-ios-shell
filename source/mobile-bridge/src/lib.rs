@@ -123,14 +123,33 @@ pub unsafe extern "C" fn rh_create(rom: *const c_char, guest: *const c_char, dat
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn rh_step(m: *mut Mobile, buttons:u32, touch:i32, x:u16, y:u16) -> i32 {
+pub unsafe extern "C" fn rh_step(m: *mut Mobile, buttons:u32, touch:i32, x:u16, y:u16, circle_x:f32, circle_y:f32) -> i32 {
     let Some(m)=m.as_mut() else { return -1; };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let started=std::time::Instant::now();
         let interval=if m.hardware||m.full_drawing {1} else {m.fixed_interval.unwrap_or(m.render_interval)};
         let draw=m.screens[0].is_empty() || (m.system.frames+1)%interval as u64==0;
         m.system.gpu.suppress_visual_draws(!draw);
+        // Titles that steer with the circle pad read its axes, not the HID
+        // direction bits, so the host has to pass the stick through. The
+        // touch d-pad and a controller's d-pad only report bits; synthesise
+        // the axes from them when the stick itself is centred, so both keep
+        // steering. hid derives the direction bits back from the axes, so
+        // the two sources stay consistent instead of firing twice.
+        // A stick that rests slightly off centre must still count as centred,
+        // or its drift would mask the digital fallback below.
+        const DEADZONE: f32 = 0.15;
+        let axis=|v: f32| if v.abs() < DEADZONE { 0.0 } else { v.clamp(-1.0,1.0) };
+        let (mut cx, mut cy) = (axis(circle_x), axis(circle_y));
+        if cx==0.0 && cy==0.0 {
+            let held=|bit:u32| buttons & bit != 0;
+            if held(1<<4) { cx = 1.0; }
+            if held(1<<5) { cx = -1.0; }
+            if held(1<<6) { cy = 1.0; }
+            if held(1<<7) { cy = -1.0; }
+        }
         m.system.set_input(InputState { buttons:PadState::from_bits_retain(buttons),
+            circle_x:cx, circle_y:cy,
             touch:(touch!=0).then_some((x.min(319),y.min(239))), ..InputState::default() });
         let outcome=m.system.run_frame();
         if m.system.frames>=120 {
