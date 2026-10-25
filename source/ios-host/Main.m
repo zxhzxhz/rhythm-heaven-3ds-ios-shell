@@ -3,6 +3,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <QuartzCore/QuartzCore.h>
 #import <GameController/GameController.h>
+#import <pthread.h>
 #import "Mobile.h"
 #include "ControllerInput.h"
 #include <string.h>
@@ -133,6 +134,10 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
 @interface Game : UIViewController {
     Mobile *machine;
     dispatch_queue_t worker;
+    NSMutableArray<void(^)(void)> *jobs;
+    NSCondition *jobsLock;
+    pthread_t runtimeThread;
+    BOOL runtimeStopping;
     CADisplayLink *display;
     UIImageView *top;
     TouchScreen *bottom;
@@ -164,8 +169,39 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     uint64_t shownVideoGeneration;
     unsigned logicFrames,visualFrames;
 }
+- (void)runtimeLoop;
+- (void)enqueue:(void(^)(void))job;
+- (void)enqueueAfter:(NSTimeInterval)delay job:(void(^)(void))job;
 @end
+static void *rh_runtime_main(void *ctx) {
+    Game *game=(__bridge Game *)ctx;
+    [game runtimeLoop];
+    return NULL;
+}
 @implementation Game
+- (void)runtimeLoop {
+    for(;;) {
+        void (^job)(void)=nil;
+        [jobsLock lock];
+        while(jobs.count==0&&!runtimeStopping) [jobsLock wait];
+        if(runtimeStopping) { [jobsLock unlock]; break; }
+        job=jobs.firstObject; [jobs removeObjectAtIndex:0];
+        [jobsLock unlock];
+        @autoreleasepool { if(job) job(); }
+    }
+}
+- (void)enqueue:(void(^)(void))job {
+    if(!job) return;
+    [jobsLock lock]; [jobs addObject:[job copy]]; [jobsLock signal]; [jobsLock unlock];
+}
+- (void)enqueueAfter:(NSTimeInterval)delay job:(void(^)(void))job {
+    if(delay<=0) { [self enqueue:job]; return; }
+    __weak Game *weakSelf=self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
+        [weakSelf enqueue:job];
+    });
+}
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
 - (void)viewDidLoad {
@@ -176,6 +212,15 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     inputLock=[NSLock new];videoLock=[NSLock new];
     dispatch_queue_attr_t priority=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INTERACTIVE,0);
     worker=dispatch_queue_create("org.rhythmheaven.3ds.runtime",priority);
+    // The recompiled guest needs more stack than a GCD worker thread gets: a
+    // single emulated frame can recurse deeply, and each AOT frame is far
+    // wider than its ARM original, so the 512 KiB GCD stack overflows and the
+    // thread faults on its guard page. Run guest work on a thread we size.
+    jobs=[NSMutableArray new]; jobsLock=[NSCondition new];
+    pthread_attr_t attr; pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr,32u*1024u*1024u);
+    pthread_create(&runtimeThread,&attr,rh_runtime_main,(__bridge void *)self);
+    pthread_attr_destroy(&attr);
     top=[UIImageView new]; bottom=[TouchScreen new];
     for (UIImageView *view in @[top,bottom]) {
         view.contentMode=UIViewContentModeScaleAspectFit; view.backgroundColor=UIColor.blackColor;
@@ -242,7 +287,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         }
     }
     sound=[Sound new];
-    dispatch_async(worker,^{ @autoreleasepool {
+    [self enqueue:^{ @autoreleasepool {
         NSBundle *bundle=NSBundle.mainBundle;
         NSString *rom=[bundle.bundlePath stringByAppendingPathComponent:@"Game/Program.cia"];
         NSString *guest=[bundle.bundlePath stringByAppendingPathComponent:@"Frameworks/Guest.framework/Guest"];
@@ -253,7 +298,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         NSString *message=[NSString stringWithUTF8String:error]?:@"启动失败";
         if(self->machine) {
             self->nextEmulationTime=CACurrentMediaTime();
-            dispatch_async(self->worker,^{[self emulateOneFrame];});
+            [self enqueue:^{[self emulateOneFrame];}];
         }
         dispatch_async(dispatch_get_main_queue(),^{
             if (!self->machine) { [self stop:message]; return; }
@@ -263,7 +308,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
             self->display.preferredFramesPerSecond=60;
             [self->display addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
         });
-    }});
+    }}];
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
@@ -508,7 +553,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         if(failed||!machine)return;
         if(paused||keyboardActive) {
             nextEmulationTime=CACurrentMediaTime();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(FramePeriod*NSEC_PER_SEC)),worker,^{[self emulateOneFrame];});
+            [self enqueueAfter:FramePeriod job:^{[self emulateOneFrame];}];
             return;
         }
         [inputLock lock];
@@ -544,7 +589,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         double now=CACurrentMediaTime();
         nextEmulationTime=rh_next_frame_deadline(nextEmulationTime,now,FramePeriod);
         double wait=MAX(0.0,nextEmulationTime-now);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(wait*NSEC_PER_SEC)),worker,^{[self emulateOneFrame];});
+        [self enqueueAfter:wait job:^{[self emulateOneFrame];}];
     }
 }
 // UIKit presents the latest completed pair at the phone's display cadence.
@@ -564,7 +609,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         double shown=visualFrames/elapsed,running=logicFrames/elapsed;
         [qualityButton setTitle:[NSString stringWithFormat:@"%.0f fps",shown] forState:UIControlStateNormal];
         NSString *metrics=[NSString stringWithFormat:@"actual pacing: visual %.2f fps, emulation %.2f fps, window %.3fs; independent producer",shown,running,elapsed];
-        dispatch_async(worker,^{rh_note(metrics.UTF8String);});
+        [self enqueue:^{rh_note(metrics.UTF8String);}];
         fpsWindowStart=now;logicFrames=visualFrames=0;
     }
 }
@@ -579,8 +624,8 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
         NSString *title=[labels[i] length]?labels[i]:(i+1==labels.count?@"确定":@"取消");
         [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
             NSString *value=alert.textFields.firstObject.text?:@"";
-            dispatch_async(self->worker,^{rh_answer(self->machine,value.UTF8String,(uint32_t)i);
-                dispatch_async(dispatch_get_main_queue(),^{self->keyboardActive=NO;[self->sound pause:self->paused];[self resetFPS];});});
+            [self enqueue:^{rh_answer(self->machine,value.UTF8String,(uint32_t)i);
+                dispatch_async(dispatch_get_main_queue(),^{self->keyboardActive=NO;[self->sound pause:self->paused];[self resetFPS];});}];
         }]];
     }
     [self presentViewController:alert animated:YES completion:nil];
@@ -593,7 +638,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     fullDrawing=!fullDrawing;
     [qualityButton setTitle:fullDrawing?@"画面:逐帧":@"画面:自动" forState:UIControlStateNormal];
     BOOL full=fullDrawing;
-    dispatch_async(worker,^{if(self->machine)rh_full_drawing(self->machine,full);});
+    [self enqueue:^{if(self->machine)rh_full_drawing(self->machine,full);}];
 }
 - (void)background { wasRunningBeforeBackground=!paused;paused=YES;[sound pause:YES];[self clearInputs];[pauseButton setTitle:@"继续" forState:UIControlStateNormal]; }
 - (void)foreground {
